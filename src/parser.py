@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 INPUT_DIR = PROJECT_ROOT / "data" / "raw" / "sample_notices"
 OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "parsing_result_notices"
 
-DEFAULT_PDF_NAME = "공고문_샘플3.pdf"
+DEFAULT_PDF_NAME = "공고문_샘플1.pdf"
 SOURCE_PDF = INPUT_DIR / DEFAULT_PDF_NAME
 
 # =============================================================================
