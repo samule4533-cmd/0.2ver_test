@@ -1,0 +1,9 @@
+
+__pycache__/
+*.pyc
+.venv/
+
+.env
+
+## 데이터
+data/

@@ -1,3 +1,6 @@
+# pdf 파일 1개만 가능 (단독 테스트용)
+# 배치 처리는 company_ingest.py 사용
+
 import asyncio
 import json
 import logging
@@ -24,7 +27,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # =============================================================================
-# Paths
+# Paths (단독 실행용 기본값 — company_ingest에서는 경로를 직접 전달)
 # =============================================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,7 +52,7 @@ else:
 # =============================================================================
 # Config
 # =============================================================================
-GEMINI_PDF_MODEL = os.getenv("GEMINI_PDF_MODEL", "gemini-3-flash-preview")
+GEMINI_PDF_MODEL = os.getenv("GEMINI_PDF_MODEL", "gemini-2.0-flash")
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192"))
 
 SAVE_FINAL_MD = True
@@ -58,6 +61,8 @@ SAVE_PARSE_REPORT = True
 SAVE_FIELDS_JSON = True
 SAVE_VECTOR_CHUNKS = True
 
+# RAG 파이프라인 최적화를 위한 파싱 프롬프트
+# 한국어 기업문서(특허/인증/회사소개) 특화 지침 포함
 PDF_PARSE_PROMPT = """
 너는 RAG 파이프라인을 위한 최고 수준의 문서 파서야.
 첨부된 PDF 문서를 읽고 레이아웃이 최대한 보존된 Markdown 형식으로 변환해줘.
@@ -69,19 +74,17 @@ PDF_PARSE_PROMPT = """
 4. 숫자, 날짜, 등록번호, 특허번호, 인증번호, 기관명, 회사명, 제품명, 기술명, 문의처 등은 원문에 가깝게 보존할 것.
 5. 본문 내 강조(**bold**), 목록, 표제어, 도면명, 도표 설명, 붙임 제목 등은 가능한 한 유지할 것.
 6. 읽기 애매한 부분은 임의로 자연스럽게 바꾸지 말고 원문에 가깝게 남길 것.
+7. 페이지 구분선(---, ===, ─── 등 구분 역할의 선)은 제거할 것. 페이지 번호는 `[p.N]` 형식으로 단독 줄에 통일하여 보존할 것 (예: `[p.3]`). 단, 특허 번호·등록번호·인증번호처럼 본문 내용에 해당하는 번호는 절대 건드리지 말 것.
 
 [회사 자료 특화 지침]
-7. 문서가 특허, 인증서, 회사소개서, 실적자료, 제안서, 기술소개서, 브로슈어 중 무엇에 가까운지 구조를 유지하며 파싱할 것.
-8. 특허 문서의 경우 발명의 명칭, 기술분야, 배경기술, 해결과제, 해결수단, 효과, 청구항, 도면 설명을 특히 정확히 보존할 것.
-9. 인증 문서의 경우 인증명, 인증기관, 인증번호, 등록일, 유효기간, 대상, 범위를 정확히 보존할 것.
-10. 회사소개/실적 자료의 경우 사업 개요, 주요 기술, 제품/서비스 설명, 프로젝트명, 발주처, 기간, 성과, 수치 정보, 표와 목록을 정확히 보존할 것.
-11. 목차가 있으면 목차 구조를 유지하고, 본문 섹션 제목이 분명하면 Markdown 헤더로 승격할 것.
-12. 문서 검색과 질의응답에 도움이 되도록, 의미 있는 제목/소제목/섹션 구분이 사라지지 않게 할 것.
-13. 특허 문서의 경우 페이지 상단 또는 하단에 기재된 등록특허번호, 공개번호, 출원번호, 문서 식별번호와 같은 식별 정보를 누락하지 말 것.
-14. 특히 첫 페이지 및 각 페이지 상단 우측/좌측의 작은 텍스트라도 특허번호, 등록번호, 문서번호에 해당하면 반드시 본문에 보존할 것.
-15. 페이지 머리글처럼 보이더라도 특허 식별번호는 문서 검색과 식별에 중요하므로 생략하지 말 것.
-16. "중략", "생략", "요약", "...", "등" 등의 축약 표현을 임의로 삽입하지 말 것.
-17. 응답은 문서에서 확인되는 내용을 처음부터 끝까지 순서대로 충실히 옮길 것.
+8. 문서가 특허, 인증서, 회사소개서, 실적자료, 제안서, 기술소개서, 브로슈어 중 무엇에 가까운지 구조를 유지하며 파싱할 것.
+9. 특허 문서의 경우 발명의 명칭, 기술분야, 배경기술, 해결과제, 해결수단, 효과, 청구항, 도면 설명을 특히 정확히 보존할 것.
+10. 인증 문서의 경우 인증명, 인증기관, 인증번호, 등록일, 유효기간, 대상, 범위를 정확히 보존할 것.
+11. 회사소개/실적 자료의 경우 사업 개요, 주요 기술, 제품/서비스 설명, 프로젝트명, 발주처, 기간, 성과, 수치 정보, 표와 목록을 정확히 보존할 것.
+12. 목차가 있으면 목차 구조를 유지하고, 본문 섹션 제목이 분명하면 Markdown 헤더로 승격할 것.
+13. 문서 검색과 질의응답에 도움이 되도록, 의미 있는 제목/소제목/섹션 구분이 사라지지 않게 할 것.
+14. "중략", "생략", "요약", "...", "등" 등의 축약 표현을 임의로 삽입하지 말 것.
+15. 응답은 문서에서 확인되는 내용을 처음부터 끝까지 순서대로 충실히 옮길 것.
 
 출력은 설명 없이 Markdown 본문만 반환할 것.
 """.strip()
@@ -97,27 +100,26 @@ def get_genai_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def korean_ratio(s: str) -> float:
-    if not s:
-        return 0.0
-    return len(re.findall(r"[가-힣]", s)) / max(len(s), 1)
-
-
-def build_output_dir(source_pdf: Path) -> Path:
+def build_output_dir(
+    source_pdf: Path,
+    input_dir: Path = None,
+    output_root: Path = None,
+) -> Path:
     """
-    입력 루트 아래 상대경로를 유지하면서 output dir 생성
-    예:
-    data/raw/company/certification_list_1/sample_company.pdf
-    ->
-    data/processed/parsing_result_company/certification_list_1/sample_company/
+    입력 루트 아래 상대경로를 유지하면서 output dir 생성.
+    company_ingest에서 호출 시 input_dir, output_root를 명시적으로 전달.
+    단독 실행 시에는 모듈 전역 INPUT_DIR, OUTPUT_ROOT 사용.
     """
-    relative_parent = source_pdf.relative_to(INPUT_DIR).parent
-    out_dir = OUTPUT_ROOT / relative_parent / source_pdf.stem
+    _input_dir = input_dir or INPUT_DIR
+    _output_root = output_root or OUTPUT_ROOT
+    relative_parent = source_pdf.relative_to(_input_dir).parent
+    out_dir = _output_root / relative_parent / source_pdf.stem
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
 
 def preflight_check(source_pdf: Path, output_dir: Path) -> Dict[str, Any]:
+    """실행 전 필수 조건 검사 (파일 존재 / API 키 / 쓰기 권한)"""
     report = {"ok": True, "checks": []}
 
     def _add(name: str, ok: bool, msg: str = ""):
@@ -142,9 +144,8 @@ def preflight_check(source_pdf: Path, output_dir: Path) -> Dict[str, Any]:
 
 def normalize_markdown_headings(markdown_text: str) -> str:
     """
-    Markdown 정규화:
-    - 줄 전체가 **제목** 형태이면 ## 제목으로 변환
-    - 그 외 본문 내 **강조** 는 그대로 둔다
+    Gemini가 줄 전체를 **제목** 형태로 출력할 경우 ## 헤더로 보정.
+    본문 내 인라인 **강조**는 그대로 유지.
     """
     lines = (markdown_text or "").splitlines()
     normalized: List[str] = []
@@ -152,10 +153,12 @@ def normalize_markdown_headings(markdown_text: str) -> str:
     for line in lines:
         s = line.strip()
 
+        # 이미 Markdown 헤더면 그대로
         if re.match(r"^\s{0,3}#{1,6}\s+", s):
             normalized.append(line)
             continue
 
+        # 줄 전체가 **텍스트** 패턴이면 ## 헤더로 변환
         m = re.match(r"^\*\*([^*]{2,120})\*\*$", s)
         if m:
             normalized.append(f"## {m.group(1).strip()}")
@@ -171,7 +174,8 @@ def normalize_markdown_headings(markdown_text: str) -> str:
 # =============================================================================
 def _upload_and_wait(client: genai.Client, file_path: Path):
     """
-    한글 파일명 업로드 이슈를 피하기 위해 영문 임시 파일명으로 복사 후 업로드
+    한글 파일명은 Gemini File API 업로드 시 오류 발생 가능.
+    임시 디렉토리에 영문명(upload_input.pdf)으로 복사 후 업로드하여 우회.
     """
     logger.info("PDF 업로드 시작: %s", file_path.name)
 
@@ -179,10 +183,11 @@ def _upload_and_wait(client: genai.Client, file_path: Path):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         safe_path = Path(tmpdir) / f"upload_input{suffix}"
-        shutil.copy2(file_path, safe_path)
+        shutil.copy2(file_path, safe_path)  # 한글명 → 영문명 복사
 
         uploaded = client.files.upload(file=str(safe_path))
 
+        # 파일 처리 완료될 때까지 폴링
         while uploaded.state.name == "PROCESSING":
             logger.info("파일 처리 중... 2초 후 재확인")
             time.sleep(2)
@@ -196,6 +201,7 @@ def _upload_and_wait(client: genai.Client, file_path: Path):
 
 
 async def parse_pdf_to_markdown(source_pdf: Path) -> str:
+    """PDF를 Gemini File API에 업로드하고 Markdown 텍스트로 변환하여 반환"""
     client = get_genai_client()
 
     uploaded_file = await asyncio.to_thread(_upload_and_wait, client, source_pdf)
@@ -205,7 +211,7 @@ async def parse_pdf_to_markdown(source_pdf: Path) -> str:
         model=GEMINI_PDF_MODEL,
         contents=[uploaded_file, PDF_PARSE_PROMPT],
         config=types.GenerateContentConfig(
-            temperature=0.0,
+            temperature=0.0,                         # 재현성을 위해 temperature 0
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         ),
     )
@@ -216,35 +222,48 @@ async def parse_pdf_to_markdown(source_pdf: Path) -> str:
 
 
 # =============================================================================
-# Main
+# 핵심 공개 함수 — company_ingest.py에서 import하여 사용
 # =============================================================================
-async def async_main():
-    source_pdf = SOURCE_PDF
-    output_dir = build_output_dir(source_pdf)
+async def parse_single_pdf(
+    source_pdf: Path,
+    input_dir: Path,
+    output_root: Path,
+) -> List[Dict[str, Any]]:
+    """
+    PDF 1개를 파싱하고 디스크에 저장한 뒤 청크 목록을 반환.
 
+    Args:
+        source_pdf:  처리할 PDF 경로
+        input_dir:   raw 데이터 루트 (상대경로 계산 기준)
+        output_root: 처리 결과를 저장할 루트
+
+    Returns:
+        vector_chunks 리스트 (company_ingest가 ChromaDB에 적재)
+    """
+    output_dir = build_output_dir(source_pdf, input_dir, output_root)
+
+    # 실행 전 필수 조건 검사
     pf = preflight_check(source_pdf, output_dir)
     with open(output_dir / "preflight.json", "w", encoding="utf-8") as f:
         json.dump(pf, f, ensure_ascii=False, indent=2)
 
     if not pf["ok"]:
-        logger.error("❌ Pre-flight check 실패")
-        for c in pf["checks"]:
-            if not c["ok"]:
-                logger.error("- %s: %s", c["name"], c["msg"])
-        return
+        failed = [c for c in pf["checks"] if not c["ok"]]
+        raise RuntimeError(f"Pre-flight check 실패 ({source_pdf.name}): {failed}")
 
     t0 = time.perf_counter()
 
+    # Gemini File API로 PDF → Markdown 변환
     markdown_text = await parse_pdf_to_markdown(source_pdf)
 
-    # 줄 전체 볼드 제목을 markdown heading으로 보정
+    # 볼드 전체줄을 헤더로 보정 (Gemini 출력 정규화)
     markdown_text = normalize_markdown_headings(markdown_text)
 
     elapsed_parse = time.perf_counter() - t0
 
-    # 회사 자료 단계에서는 field 추출 비활성화
-    fields: Dict[str, Any] = {}
+    fields: Dict[str, Any] = {}  # 회사 자료는 field 추출 비활성화
 
+    # 헤더 기반 청크 분리
     text_chunks = split_markdown_into_chunks(
         markdown_text=markdown_text,
         document_id=source_pdf.stem,
@@ -252,13 +271,12 @@ async def async_main():
         model_name=GEMINI_PDF_MODEL,
     )
 
-    chunks = text_chunks
     elapsed_total = time.perf_counter() - t0
 
     document_json = build_document_json(
         source_pdf=source_pdf,
         markdown_text=markdown_text,
-        chunks=chunks,
+        chunks=text_chunks,
         elapsed_sec=elapsed_total,
         fields=fields,
         image_count=0,
@@ -268,9 +286,9 @@ async def async_main():
     parse_report = {
         "source_file": str(source_pdf),
         "document_id": source_pdf.stem,
-        "doc_source_type": DOC_SOURCE_TYPE,
-        "input_dir": str(INPUT_DIR),
-        "output_root": str(OUTPUT_ROOT),
+        "doc_source_type": "company",
+        "input_dir": str(input_dir),
+        "output_root": str(output_root),
         "mode": "fast_gemini_file_api",
         "model": GEMINI_PDF_MODEL,
         "elapsed_parse_sec": round(elapsed_parse, 3),
@@ -278,7 +296,7 @@ async def async_main():
         "text_len": len(markdown_text or ""),
         "text_chunk_count": len(text_chunks),
         "image_chunk_count": 0,
-        "chunk_count": len(chunks),
+        "chunk_count": len(text_chunks),
         "field_keys": list(fields.keys()),
         "warnings": [],
         "errors": [],
@@ -291,7 +309,7 @@ async def async_main():
         document_json=document_json,
         parse_report=parse_report,
         fields=fields,
-        chunks=chunks,
+        chunks=text_chunks,
         save_final_md=SAVE_FINAL_MD,
         save_final_json=SAVE_FINAL_JSON,
         save_parse_report=SAVE_PARSE_REPORT,
@@ -299,7 +317,20 @@ async def async_main():
         save_vector_chunks=SAVE_VECTOR_CHUNKS,
     )
 
-    logger.info("🎉 완료! (Gemini File API + Markdown + JSON + Vector Chunks)")
+    logger.info("파싱 저장 완료: %s → %d 청크 (%.1f초)", source_pdf.name, len(text_chunks), elapsed_total)
+    return text_chunks
+
+
+# =============================================================================
+# 단독 실행용 진입점 (단일 파일 테스트)
+# =============================================================================
+async def async_main():
+    chunks = await parse_single_pdf(
+        source_pdf=SOURCE_PDF,
+        input_dir=INPUT_DIR,
+        output_root=OUTPUT_ROOT,
+    )
+    logger.info("🎉 완료! 총 %d개 청크 생성", len(chunks))
 
 
 def main():

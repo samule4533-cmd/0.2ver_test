@@ -1,0 +1,18 @@
+[project]
+name = "autodraft-clean"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "chromadb>=1.5.5",
+    "docling>=2.77.0",
+    "easyocr>=1.7.2",
+    "google-genai>=1.66.0",
+    "numpy>=2.4.3",
+    "openai>=2.26.0",
+    "pillow>=12.1.1",
+    "pymupdf>=1.27.1",
+    "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.2.3",
+]

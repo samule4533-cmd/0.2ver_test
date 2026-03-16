@@ -1,3 +1,4 @@
+# 단독 pdf만 수행
 import json
 import logging
 import os
@@ -52,12 +53,9 @@ def clean_metadata_for_chroma(metadata: Dict[str, Any]) -> Dict[str, Any]:
 def prepare_chroma_items(
     chunks: List[Dict[str, Any]],
     default_doc_type: Optional[str] = None,
-    exclude_image_chunks: bool = True,
 ) -> Dict[str, List[Any]]:
     """
-    base rules 반영:
     - 빈 텍스트 제외
-    - image_caption 제외 옵션
     - metadata 정리
     - doc_type 기본값 보정
     """
@@ -71,10 +69,6 @@ def prepare_chroma_items(
             continue
 
         metadata = dict(chunk.get("metadata", {}))
-
-        # 현재 image_caption은 노이즈 가능성이 있어 기본 제외
-        if exclude_image_chunks and metadata.get("chunk_type") == "image_caption":
-            continue
 
         if default_doc_type and not metadata.get("doc_type"):
             metadata["doc_type"] = default_doc_type
@@ -92,75 +86,167 @@ def prepare_chroma_items(
     }
 
 
-def get_notice_chunks_path_from_env() -> Path:
-    default_pdf_name = os.getenv("DEFAULT_PDF_NAME", "sample1.pdf")
-    document_id = Path(default_pdf_name).stem
-    return (
-        PROJECT_ROOT
-        / "data"
-        / "processed"
-        / "parsing_result_notices"
-        / document_id
-        / "vector_chunks.json"
-    )
-
-
 def get_chroma_dir() -> Path:
     return PROJECT_ROOT / "data" / "vector_store" / "chroma"
 
 
 # =============================================================================
-# Local Embedding Function
+# Embedding Functions
 # =============================================================================
 def get_local_embedding_function(
     model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 ):
-    """
-    한국어 포함 다국어 대응 가능한 로컬 임베딩 모델
-    """
+    """로컬 SentenceTransformer 임베딩 (API 비용 없음, 오프라인 가능)"""
     return SentenceTransformerEmbeddingFunction(model_name=model_name)
 
 
+class _OpenAIEmbeddingFunction:
+    """
+    OpenAI Embeddings API를 ChromaDB embedding_function 형식으로 감싼 클래스.
+    text-embedding-3-small: 1536차원, 한국어 기술문서에서 로컬 모델보다 정밀도 높음.
+    """
+
+    def __init__(self, api_key: str, model: str = "text-embedding-3-small"):
+        from openai import OpenAI
+        self._client = OpenAI(api_key=api_key)
+        self._model = model
+
+    def name(self) -> str:
+        # ChromaDB가 컬렉션 생성/접근 시 임베딩 함수 충돌 검증에 사용
+        return f"openai_{self._model}"
+
+    def _embed(self, input: List[str]) -> List[List[float]]:
+        # text-embedding-3-small 최대 8192 토큰 제한
+        # 한국어 1글자 ≈ 2~3 토큰 기준으로 2500자를 안전 상한선으로 사용
+        MAX_CHARS = 2500
+        safe_input = []
+        for text in input:
+            if len(text) > MAX_CHARS:
+                logger.warning("청크 길이 초과(%d자) → %d자로 truncate", len(text), MAX_CHARS)
+                text = text[:MAX_CHARS]
+            safe_input.append(text)
+        response = self._client.embeddings.create(input=safe_input, model=self._model)
+        return [item.embedding for item in response.data]
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self._embed(input)
+
+    def embed_documents(self, input: List[str]) -> List[List[float]]:
+        return self._embed(input)
+
+    def embed_query(self, input: List[str]) -> List[List[float]]:
+        return self._embed(input)
+
+
+def get_openai_embedding_function(
+    model: str = "text-embedding-3-small",
+    api_key: Optional[str] = None,
+) -> _OpenAIEmbeddingFunction:
+    """OpenAI 임베딩 함수 반환. API 키는 인자 또는 OPENAI_API_KEY 환경변수에서 읽음."""
+    key = api_key or os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY 환경변수가 없습니다.")
+    return _OpenAIEmbeddingFunction(api_key=key, model=model)
+
+
+def get_embedding_function(
+    provider: str = "local",
+    model: Optional[str] = None,
+):
+    """
+    임베딩 함수 선택.
+    provider: 'openai' → OpenAI API 사용
+              'local'  → SentenceTransformer 사용 (기본값)
+    """
+    if provider == "openai":
+        _model = model or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        return get_openai_embedding_function(model=_model)
+
+    # local
+    _model = model or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    return get_local_embedding_function(model_name=_model)
+
+
+# =============================================================================
+# Collection Management
+# =============================================================================
 def get_or_create_collection(
     persist_dir: str,
     collection_name: str,
-    embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    embedding_provider: str = "local",
+    embedding_model: Optional[str] = None,
 ):
+    """
+    ChromaDB 컬렉션 가져오거나 생성.
+    embedding_provider가 달라지면 반드시 다른 collection_name 사용 또는
+    reset_collection()으로 기존 컬렉션을 먼저 삭제해야 함 (차원 불일치 방지).
+    """
     client = chromadb.PersistentClient(path=persist_dir)
+    ef = get_embedding_function(provider=embedding_provider, model=embedding_model)
 
-    local_ef = get_local_embedding_function(model_name=embedding_model_name)
-
+    # hnsw:space="cosine" → 벡터 간 거리 계산 방식을 코사인 거리로 지정.
+    # 유클리드 거리(l2)와 달리 벡터 크기(길이)를 무시하고 방향(각도)만 비교하므로,
+    # 청크 길이가 들쑥날쑥한 한국어 문서 임베딩에 더 안정적.
+    # 컬렉션 생성 시에만 적용되며, 이후 변경 불가(바꾸려면 reset_collection() 필요).
     collection = client.get_or_create_collection(
         name=collection_name,
-        embedding_function=local_ef,
+        embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
     return collection
 
 
+def reset_collection(
+    collection_name: str,
+    persist_dir: str,
+    embedding_provider: str = "openai",
+    embedding_model: Optional[str] = None,
+):
+    """
+    컬렉션 삭제 후 재생성.
+    임베딩 모델(provider)을 교체할 때 반드시 호출해야 함.
+    기존 벡터와 새 벡터는 차원이 달라 같은 컬렉션에 공존 불가.
+    """
+    client = chromadb.PersistentClient(path=persist_dir)
+
+    try:
+        client.delete_collection(name=collection_name)
+        logger.info("기존 컬렉션 삭제 완료: %s", collection_name)
+    except Exception:
+        logger.info("삭제할 컬렉션 없음 (신규 생성): %s", collection_name)
+
+    return get_or_create_collection(
+        persist_dir=persist_dir,
+        collection_name=collection_name,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+    )
+
+
 # =============================================================================
-# Chroma Upsert
+# Upsert
 # =============================================================================
 def upsert_chunks_to_chroma(
     chunks: List[Dict[str, Any]],
-    collection_name: str = "ninewatt_bids_local",
+    collection_name: str = "ninewatt_company",
     persist_dir: str = "data/vector_store/chroma",
     batch_size: int = 50,
-    embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    embedding_provider: str = "local",
+    embedding_model: Optional[str] = None,
     default_doc_type: Optional[str] = None,
-    exclude_image_chunks: bool = True,
 ):
+    """
+    청크 목록을 ChromaDB에 upsert (중복 chunk_id는 덮어씀).
+    배치 단위로 처리하여 메모리 부하 방지.
+    """
     collection = get_or_create_collection(
         persist_dir=persist_dir,
         collection_name=collection_name,
-        embedding_model_name=embedding_model_name,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
     )
 
-    items = prepare_chroma_items(
-        chunks=chunks,
-        default_doc_type=default_doc_type,
-        exclude_image_chunks=exclude_image_chunks,
-    )
+    items = prepare_chroma_items(chunks=chunks, default_doc_type=default_doc_type)
 
     total_chunks = len(items["ids"])
     logger.info("총 %d개의 청크를 DB에 적재 시작...", total_chunks)
@@ -169,63 +255,64 @@ def upsert_chunks_to_chroma(
         logger.warning("적재할 청크가 없습니다.")
         return collection
 
+    # 배치 단위로 나눠서 upsert (OpenAI API rate limit 고려)
     for i in range(0, total_chunks, batch_size):
         end_idx = min(i + batch_size, total_chunks)
 
-        batch_ids = items["ids"][i:end_idx]
-        batch_docs = items["documents"][i:end_idx]
-        batch_metas = items["metadatas"][i:end_idx]
-
-        logger.info("Upserting batch %d ~ %d", i, end_idx)
-
         collection.upsert(
-            ids=batch_ids,
-            documents=batch_docs,
-            metadatas=batch_metas,
+            ids=items["ids"][i:end_idx],
+            documents=items["documents"][i:end_idx],
+            metadatas=items["metadatas"][i:end_idx],
         )
+        logger.info("Upsert 완료: %d ~ %d / %d", i + 1, end_idx, total_chunks)
 
-    logger.info("✅ ChromaDB 적재 완료!")
-    logger.info("현재 collection count: %d", collection.count())
+    logger.info("ChromaDB 적재 완료! 현재 컬렉션 총 청크 수: %d", collection.count())
     return collection
 
 
 def load_and_upsert_chunks(
     chunks_path: Path,
-    collection_name: str = "ninewatt_bids_local",
+    collection_name: str = "ninewatt_company",
     persist_dir: str = "data/vector_store/chroma",
     batch_size: int = 50,
-    embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    embedding_provider: str = "local",
+    embedding_model: Optional[str] = None,
     default_doc_type: Optional[str] = None,
-    exclude_image_chunks: bool = True,
 ):
+    """JSON 파일에서 청크를 로드하여 ChromaDB에 upsert"""
     chunks = load_chunks_from_json(chunks_path)
-
     return upsert_chunks_to_chroma(
         chunks=chunks,
         collection_name=collection_name,
         persist_dir=persist_dir,
         batch_size=batch_size,
-        embedding_model_name=embedding_model_name,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
         default_doc_type=default_doc_type,
-        exclude_image_chunks=exclude_image_chunks,
     )
 
 
 # =============================================================================
-# Query Helpers
+# Query
 # =============================================================================
 def query_collection(
     query_text: str,
-    collection_name: str = "ninewatt_bids_local",
+    collection_name: str = "ninewatt_company",
     persist_dir: str = "data/vector_store/chroma",
-    embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    embedding_provider: str = "local",
+    embedding_model: Optional[str] = None,
     n_results: int = 5,
     where: Optional[Dict[str, Any]] = None,
 ):
+    """
+    자연어 쿼리로 유사 청크 검색.
+    where: ChromaDB 메타데이터 필터 (예: {"doc_type": "company"})
+    """
     collection = get_or_create_collection(
         persist_dir=persist_dir,
         collection_name=collection_name,
-        embedding_model_name=embedding_model_name,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
     )
 
     results = collection.query(
@@ -237,6 +324,7 @@ def query_collection(
 
 
 def print_query_summary(query_text: str, results: Dict[str, Any]) -> None:
+    """검색 결과를 rank/id/header/distance/본문 형식으로 출력"""
     print(f"\n[질문] {query_text}")
 
     ids = results.get("ids", [[]])
@@ -254,72 +342,45 @@ def print_query_summary(query_text: str, results: Dict[str, Any]) -> None:
     top_distances = distances[0] if distances else []
 
     for i, chunk_id in enumerate(top_ids):
-        header = ""
-        if i < len(top_metas) and top_metas[i]:
-            header = top_metas[i].get("header", "")
-
+        header = top_metas[i].get("header", "") if i < len(top_metas) and top_metas[i] else ""
         dist = top_distances[i] if i < len(top_distances) else None
-        preview = top_docs[i][:180].replace("\n", " ") if i < len(top_docs) else ""
+        full_text = top_docs[i] if i < len(top_docs) else ""
 
         print(f"\n  - rank {i+1}")
         print(f"    id       : {chunk_id}")
         print(f"    header   : {header}")
-        print(f"    distance : {dist}")
-        print(f"    preview  : {preview}...")
+        print(f"    distance : {dist:.4f}" if dist is not None else "    distance : -")
+        print("    full_text:")
+        print(full_text)
+        print("    " + "-" * 80)
 
 
 # =============================================================================
-# Example CLI Entry
+# CLI Entry (쿼리 테스트용 단독 실행)
 # =============================================================================
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-    notice_chunks_path = get_notice_chunks_path_from_env()
-    chroma_dir = get_chroma_dir()
+    chroma_dir = str(get_chroma_dir())
 
-    logger.info("현재 vector_chunks 경로: %s", notice_chunks_path)
-    logger.info("현재 Chroma 저장 경로: %s", chroma_dir)
+    # .env에서 임베딩 설정 읽기
+    embedding_provider = os.getenv("EMBEDDING_PROVIDER", "local")
+    collection_name = os.getenv("CHROMA_COLLECTION_NAME", "ninewatt_company")
 
-    if not notice_chunks_path.exists():
-        logger.warning("vector_chunks.json 파일이 없습니다: %s", notice_chunks_path)
+    logger.info("Chroma 저장 경로: %s", chroma_dir)
+    logger.info("임베딩 provider: %s | 컬렉션: %s", embedding_provider, collection_name)
+
+    try:
+        client = chromadb.PersistentClient(path=chroma_dir)
+        col = client.get_collection(collection_name)
+        print(f"\n[컬렉션 현황] {collection_name}: {col.count()}개 청크")
+    except Exception as e:
+        print(f"컬렉션을 찾을 수 없습니다: {e}")
+        print("먼저 company_ingest.py를 실행하여 데이터를 적재하세요.")
         return
 
-    collection = load_and_upsert_chunks(
-        chunks_path=notice_chunks_path,
-        collection_name="ninewatt_bids_local",
-        persist_dir=str(chroma_dir),
-        batch_size=50,
-        embedding_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        default_doc_type="notice",
-        exclude_image_chunks=True,
-    )
-
-    print("\n[컬렉션 적재 확인]")
-    print("collection count:", collection.count())
-
-    sample = collection.get(limit=3)
-    print("sample ids:", sample.get("ids"))
-    print("sample metadatas:", sample.get("metadatas"))
-
-    test_queries = [
-        "입찰시 어떤 서류를 제출해야 하나?",
-        "입찰보증금은 어떻게 되나?",
-        "입찰참가자격이 무엇인가?",
-        "문의처 연락처는?",
-        "기초금액은 얼마인가?",
-    ]
-
-    print("\n[질문 테스트 시작]")
-    for q in test_queries:
-        results = query_collection(
-            query_text=q,
-            collection_name="ninewatt_bids_local",
-            persist_dir=str(chroma_dir),
-            embedding_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            n_results=5,
-            where={"doc_type": "notice"},
-        )
-        print_query_summary(q, results)
+    # 쿼리 테스트는 RAG 구현 후 별도 스크립트에서 진행
+    print("\n[sanity check 완료] 적재 확인 후 rag_chain.py에서 end-to-end 테스트 진행")
 
 
 if __name__ == "__main__":
