@@ -55,12 +55,6 @@ data/raw/{company|sample_notices}/{subdir}/{file}.pdf
 
 `pdf_parser.py`의 `_upload_and_wait()`는 한글 파일명 업로드 오류를 피하기 위해 임시 디렉토리에 영문명(`upload_input.pdf`)으로 복사 후 업로드한다.
 
-### 출력 디렉토리 구조
-
-입력 경로의 상대 구조가 출력에도 유지된다:
-- 입력: `data/raw/company/certification_list_1/sample_company.pdf`
-- 출력: `data/processed/parsing_result_company/certification_list_1/sample_company/`
-
 ### ChromaDB 컬렉션 구성
 
 - 컬렉션명: `ninewatt_company_local` (company 문서)
@@ -74,11 +68,128 @@ data/raw/{company|sample_notices}/{subdir}/{file}.pdf
 - `company_ingest.py`: 여러 PDF 일괄 처리 로직 없음
 - `main.py`: 실질적 오케스트레이션 없음
 
+## 내가 생각한 RAG 아키텍처 마일스톤
+이 단계는 프로젝트의 핵심이라고 생각하고 있으며, 단순 예제 수준이 아니라 **실제 서비스 MVP에 바로 연결 가능한 구조**를 기준으로 설계/구현 방향을 정리해주길 바란다.
+
+---
+
+## 현재 목표
+
+`rag_chain.py`에서 구현하려는 기본 기능은 아래와 같다.
+
+1. `query_collection()`을 호출해 ChromaDB에서 유사 청크 n개 검색
+2. distance threshold를 적용해 관련성이 낮은 청크 제외
+3. 검색된 청크 본문과 메타데이터(`header`, `source_file`)를 조합해 프롬프트 구성
+4. Gemini LLM 호출
+5. 자연어 답변 반환
+6. 답변에 출처 인용 포함 (`chunk_id`, `header`, `source_file`)
+
+다만, 위 기능을 단순 나열형으로 구현하는 것이 아니라, **환각 방지**, **운영 안정성**, **추후 확장성**까지 고려한 구조로 설계하고 싶다.
+
+---
+
+## 2. 현재 생각 중인 마일스톤
+
+### Phase 1: MVP 코어 구현
+지금 당장 필요한 단계이며, 아래 항목은 필수라고 생각한다.
+
+- **유사도 검색 및 필터링**
+  - `query_collection()` 호출
+  - distance threshold 적용
+  - 노이즈 청크 제거
+
+- **Fallback 강제**
+  - threshold 적용 후 남은 청크가 0개이면 Gemini 호출을 생략하거나
+  - 시스템 차원에서 `"사내 문서에 해당 내용이 없습니다"`처럼 답변하도록 강제
+  - 목적: 환각 방지
+
+- **프롬프트 조합 및 생성**
+  - 검색된 본문 + 메타데이터를 조합해 Gemini에 전달
+  - 답변 시 `chunk_id`, `header`, `source_file` 기반 출처 인용 강제
+
+### Phase 2: 대화형 UX 통합
+서버 연동 시점에 붙일 계획이다.
+
+- Chat History 반영
+- Query Reformulation 추가
+- 연속 질문 대응  
+  예: `"그럼 거기는 얼마야?"` 같은 질문을 이전 맥락으로 해석
+
+### Phase 3: 검색 품질 고도화
+E2E 테스트 후 도입 검토 예정.
+
+- 하이브리드 검색
+  - 벡터 검색 + 키워드 검색(BM25 등)
+
+- Small-to-Big Retrieval
+  - 검색은 작은 청크로
+  - LLM에는 더 큰 문맥 단위 전달
+
+- 메타데이터 사전 필터링
+  - 질문에서 연도/부서 등을 추출해 ChromaDB `where` 조건으로 범위 축소
+
+---
+
+## 3. 내가 중요하게 보는 방향
+
+- 지금은 **과한 고도화보다 안전한 MVP**가 중요하다.
+- 모르면 모른다고 답하는 챗봇이 더 좋다.
+- 출처 없는 답변은 최대한 막고 싶다.
+- 구조는 단순하되, Phase 2/3로 자연스럽게 확장 가능해야 한다.
+- `rag_chain.py`는 프로젝트 핵심 80%라고 생각한다.
+
+---
+
+## 4. 구현 시 반드시 고려해야 하는 포인트
+
+### (1) 거리 metric 확인
+- ChromaDB에서 사용하는 거리 지표가 L2인지 cosine distance인지 반드시 확인해야 한다.
+- threshold 비교 부등호 방향이 metric에 따라 달라질 수 있다.
+- 이 부분이 틀리면 retrieval 로직 전체가 반대로 동작할 수 있다.
+- 따라서 metric과 threshold는 하드코딩하지 말고 config로 분리하는 것이 좋다.
+
+### (2) retrieval과 generation 평가 분리
+품질 테스트 시 아래를 분리해서 볼 수 있어야 한다.
+
+1. 검색기가 맞는 문서를 찾았는가
+2. 생성기가 찾은 문서 안에서만 답했는가
+
+이렇게 나눠야 threshold 문제인지, 프롬프트 문제인지, chunking 문제인지 디버깅이 가능하다.
+
+---
+
+## 5. 네가 해줬으면 하는 일
+
+아래 항목을 중심으로 종합적으로 정리해줘.
+
+1. 현재 설계가 MVP 기준으로 충분한지 평가
+2. 부족하다면 무엇을 추가해야 하는지
+3. `rag_chain.py`를 어떤 함수 단위로 나누면 좋은지
+4. threshold / fallback / citation을 어떤 방식으로 넣는 것이 좋은지
+5. 프롬프트를 어떤 원칙으로 구성해야 하는지
+6. 나중에 chat history / hybrid retrieval / metadata filtering / small-to-big을 붙이기 쉬운 구조인지 검토
+7. 실제 운영 가능한 수준으로 만들기 위한 최소 방어 로직 제안
+8. 가능하면 `rag_chain.py`의 pseudocode 또는 Python skeleton 제안
+
+---
+
+## 6. 답변할 때 꼭 반영해줬으면 하는 관점
+
+아래 관점에서 다양하게 판단해줘.
+
+- 아키텍처 관점
+- 운영 안정성 관점
+- 환각 방지 관점
+- 디버깅/평가 관점
+- 추후 확장성 관점
+- 응답 품질 관점
+- 구현 난이도 대비 효율 관점
+
 ## 개발 방향 및 작업 원칙
 
 ### 핵심 목표
 이 프로젝트는 단순 PDF 텍스트 추출기가 아니라, 회사 문서를 신뢰 가능한 지식 자원으로 변환하기 위한 파이프라인이다.  
-최종 목표는 PDF 문서 파싱 → 청킹 → 벡터DB 적재를 거쳐, 사내 챗봇이 근거 기반 질의응답을 수행할 수 있도록 만드는 것이다.
+최종 목표는 PDF 문서 파싱 → 청킹 → 벡터DB 적재를 거쳐, 1차적으로 사내 챗봇이 근거 기반 질의응답을 수행할 수 있도록 만드는 것이다.
 
 ### 중요 기준
 - 정확도 우선
